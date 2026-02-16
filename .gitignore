@@ -1,0 +1,6 @@
+node_modules/
+.env
+geminicli-bridge.pid
+geminicli-bridge.log
+*.log
+*.pid

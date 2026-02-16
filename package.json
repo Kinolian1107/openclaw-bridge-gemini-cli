@@ -1,0 +1,27 @@
+{
+    "name": "geminicli-bridge",
+    "version": "1.0.0",
+    "description": "OpenAI-compatible API proxy that bridges OpenClaw to Gemini CLI, enabling use of Gemini models through the Gemini CLI headless mode",
+    "type": "module",
+    "main": "geminicli-bridge.mjs",
+    "scripts": {
+        "start": "node geminicli-bridge.mjs",
+        "dev": "node --watch geminicli-bridge.mjs"
+    },
+    "engines": {
+        "node": ">=22"
+    },
+    "keywords": [
+        "gemini",
+        "gemini-cli",
+        "openclaw",
+        "openai-compatible",
+        "api-proxy",
+        "bridge"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/Kinolian1107/geminicli-bridge.git"
+    },
+    "license": "MIT"
+}
