@@ -21,7 +21,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { writeFileSync, unlinkSync, mkdtempSync } from "node:fs";
+import { writeFileSync, unlinkSync, mkdtempSync, createReadStream, rmdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -29,7 +29,7 @@ import { tmpdir } from "node:os";
 const CONFIG = {
     port: parseInt(process.env.BRIDGE_PORT || "18791"),
     host: process.env.BRIDGE_HOST || "127.0.0.1",
-    geminiModel: process.env.GEMINI_MODEL || "gemini-3-pro-preview",
+    geminiModel: process.env.GEMINI_MODEL || "gemini-3-flash-preview",
     geminiBin: process.env.GEMINI_BIN || "gemini",
     // Approval mode: 'default', 'auto_edit', 'yolo'
     // 'yolo' = auto-approve all tool calls (default for bridge mode,
@@ -45,6 +45,13 @@ const CONFIG = {
     // Working directory for Gemini CLI (affects file access scope)
     workingDir: process.env.GEMINI_WORKING_DIR || process.env.HOME,
 };
+
+// Supported models that this bridge can serve
+// These are advertised via GET /v1/models and used for dynamic model switching
+const SUPPORTED_MODELS = [
+    { id: "gemini-3-pro-preview", name: "Gemini 3 Pro Preview" },
+    { id: "gemini-3-flash-preview", name: "Gemini 3 Flash Preview" },
+];
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
@@ -99,6 +106,18 @@ function messagesToPrompt(messages) {
         }
     }
 
+    // Inject default system instruction if not present or append to it
+    const defaultSystem = "You are a helpful AI assistant. IMPORTANT: When you use tools, you MUST use the tool output to generate a complete, helpful response to the user. Do not stop after just stating your intent to use a tool.";
+
+    let hasSystem = false;
+    for (const msg of messages) {
+        if (msg.role === "system") hasSystem = true;
+    }
+
+    if (!hasSystem) {
+        parts.unshift(`[System Instructions]\n${defaultSystem}\n[End System Instructions]`);
+    }
+
     return parts.join("\n\n");
 }
 
@@ -147,22 +166,43 @@ function cleanupTempFile(filePath) {
     try {
         unlinkSync(filePath);
         const dir = filePath.replace(/\/[^/]+$/, "");
-        require("node:fs").rmdirSync(dir);
+        rmdirSync(dir);
     } catch { }
 }
 
 /**
  * Classify Gemini CLI errors.
+ * NOTE: Order matters! Check more specific errors first.
  */
 function classifyError(err, stderr) {
     const msg = (err?.message || "") + " " + (stderr || "");
 
-    if (msg.includes("AuthError") || msg.includes("authentication") || msg.includes("credential")) {
-        return { status: 401, message: "Gemini CLI authentication error. Run 'gemini' interactively to set up auth.", type: "auth_error" };
+    // Check for rate limit / capacity errors FIRST (before auth check)
+    // Gemini API returns these as 429 with specific error reasons
+    if (msg.includes("429") ||
+        msg.includes("MODEL_CAPACITY_EXHAUSTED") ||
+        msg.includes("RESOURCE_EXHAUSTED") ||
+        msg.includes("No capacity available") ||
+        msg.includes("rate limit") ||
+        msg.includes("quota")) {
+        return {
+            status: 429,
+            message: "Gemini API capacity or rate limit exceeded. Please try again later or use a different model.",
+            type: "rate_limit"
+        };
     }
-    if (msg.includes("quota") || msg.includes("rate limit") || msg.includes("429")) {
-        return { status: 429, message: "Rate limit or quota exceeded", type: "rate_limit" };
+
+    // Only treat as auth error if it's clearly authentication-related
+    // AND not a capacity issue (which sometimes mentions "authentication" in stack traces)
+    if ((msg.includes("AuthError") || msg.includes("credential") ||
+        (msg.includes("authentication") && !msg.includes("429") && !msg.includes("capacity")))) {
+        return {
+            status: 401,
+            message: "Gemini CLI authentication error. Run 'gemini' interactively to set up auth.",
+            type: "auth_error"
+        };
     }
+
     if (msg.includes("context") || msg.includes("token limit") || msg.includes("too long")) {
         return { status: 400, message: "Context window exceeded", type: "context_overflow" };
     }
@@ -178,10 +218,20 @@ function classifyError(err, stderr) {
 
 // ─── Core: Run Gemini CLI ────────────────────────────────────────
 
-function runGeminiCLI(prompt, model, stream, res) {
+function runGeminiCLI(prompt, requestModel, stream, res) {
     const requestId = `chatcmpl-${randomUUID()}`;
     const created = Math.floor(Date.now() / 1000);
-    const modelName = model || `gemini/${CONFIG.geminiModel}`;
+
+    // Support dynamic model switching: use the model from the request if provided,
+    // otherwise fall back to the configured default.
+    // The request model may come as "gemini-3-pro-preview", "gemini/gemini-3-pro-preview",
+    // or "bridge-gemini-cli/gemini-3-pro-preview" — extract the bare model ID.
+    let geminiModel = CONFIG.geminiModel;
+    if (requestModel) {
+        const bare = requestModel.replace(/^(?:bridge-gemini-cli|gemini)\//, "");
+        if (bare) geminiModel = bare;
+    }
+    const modelName = `gemini/${geminiModel}`;
 
     // Determine if we need to pipe prompt via stdin
     const useStdinPipe = prompt.length > CONFIG.maxArgLen;
@@ -190,7 +240,7 @@ function runGeminiCLI(prompt, model, stream, res) {
     const args = [];
 
     // Model
-    args.push("--model", CONFIG.geminiModel);
+    args.push("--model", geminiModel);
 
     // Output format
     if (stream) {
@@ -217,7 +267,7 @@ function runGeminiCLI(prompt, model, stream, res) {
     }
 
     console.log(
-        `[${new Date().toISOString()}] → Request ${requestId.slice(-8)}: model=${CONFIG.geminiModel} stream=${stream} prompt=${prompt.length} chars (${useStdinPipe ? "stdin-pipe" : "arg"}) approval=${CONFIG.approvalMode}`
+        `[${new Date().toISOString()}] → Request ${requestId.slice(-8)}: model=${geminiModel} stream=${stream} prompt=${prompt.length} chars (${useStdinPipe ? "stdin-pipe" : "arg"}) approval=${CONFIG.approvalMode}`
     );
 
     const proc = spawn(CONFIG.geminiBin, args, {
@@ -233,7 +283,6 @@ function runGeminiCLI(prompt, model, stream, res) {
 
     // If using stdin pipe, feed the prompt
     if (useStdinPipe && tempFile) {
-        const { createReadStream } = require("node:fs");
         const fileStream = createReadStream(tempFile);
         fileStream.pipe(proc.stdin);
         fileStream.on("end", () => {
@@ -243,16 +292,31 @@ function runGeminiCLI(prompt, model, stream, res) {
         });
     }
 
-    // Timeout
+    // Timeout: overall request timeout
     const timer = setTimeout(() => {
         console.error(`[${new Date().toISOString()}] ✗ Request ${requestId.slice(-8)}: timeout after ${CONFIG.timeoutMs / 1000}s`);
         proc.kill("SIGTERM");
         setTimeout(() => proc.kill("SIGKILL"), 5000);
     }, CONFIG.timeoutMs);
 
+    // Inactivity watchdog: kill process if no stdout/stderr output for too long.
+    // This catches the case where Gemini CLI hangs (connection stuck, process frozen).
+    const INACTIVITY_TIMEOUT_MS = parseInt(process.env.BRIDGE_INACTIVITY_TIMEOUT_MS || "120000"); // 2 minutes
+    let lastActivityTime = Date.now();
+    const inactivityTimer = setInterval(() => {
+        const idleMs = Date.now() - lastActivityTime;
+        if (idleMs > INACTIVITY_TIMEOUT_MS) {
+            console.error(`[${new Date().toISOString()}] ✗ Request ${requestId.slice(-8)}: inactivity watchdog triggered (${(idleMs / 1000).toFixed(0)}s idle) — killing hung process`);
+            clearInterval(inactivityTimer);
+            proc.kill("SIGTERM");
+            setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+        }
+    }, 10000); // check every 10s
+
     let stderrOutput = "";
     proc.stderr.on("data", (chunk) => {
         stderrOutput += chunk.toString();
+        lastActivityTime = Date.now();
     });
 
     const startTime = Date.now();
@@ -287,6 +351,7 @@ function runGeminiCLI(prompt, model, stream, res) {
         res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
         proc.stdout.on("data", (data) => {
+            lastActivityTime = Date.now();
             buffer += data.toString();
             const lines = buffer.split("\n");
             buffer = lines.pop() || ""; // keep incomplete last line in buffer
@@ -365,6 +430,7 @@ function runGeminiCLI(prompt, model, stream, res) {
 
         proc.on("close", (code) => {
             clearTimeout(timer);
+            clearInterval(inactivityTimer);
             if (tempFile) cleanupTempFile(tempFile);
 
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -400,11 +466,13 @@ function runGeminiCLI(prompt, model, stream, res) {
         let stdout = "";
 
         proc.stdout.on("data", (data) => {
+            lastActivityTime = Date.now();
             stdout += data.toString();
         });
 
         proc.on("close", (code) => {
             clearTimeout(timer);
+            clearInterval(inactivityTimer);
             if (tempFile) cleanupTempFile(tempFile);
 
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -436,7 +504,7 @@ function runGeminiCLI(prompt, model, stream, res) {
 
             // Extract token usage from Gemini CLI stats
             let usage;
-            const modelStats = stats.models?.[CONFIG.geminiModel];
+            const modelStats = stats.models?.[geminiModel];
             if (modelStats?.tokens) {
                 usage = {
                     prompt_tokens: modelStats.tokens.prompt || modelStats.tokens.input || estimateTokens(prompt),
@@ -483,6 +551,7 @@ function runGeminiCLI(prompt, model, stream, res) {
 
     proc.on("error", (err) => {
         clearTimeout(timer);
+        clearInterval(inactivityTimer);
         if (tempFile) cleanupTempFile(tempFile);
 
         const classified = classifyError(err, stderrOutput);
@@ -536,17 +605,16 @@ const server = createServer(async (req, res) => {
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
         });
+        const now = Math.floor(Date.now() / 1000);
         res.end(
             JSON.stringify({
                 object: "list",
-                data: [
-                    {
-                        id: `gemini/${CONFIG.geminiModel}`,
-                        object: "model",
-                        created: Math.floor(Date.now() / 1000),
-                        owned_by: "google",
-                    },
-                ],
+                data: SUPPORTED_MODELS.map((m) => ({
+                    id: m.id,
+                    object: "model",
+                    created: now,
+                    owned_by: "google",
+                })),
             })
         );
         return;
@@ -626,6 +694,38 @@ server.on("error", (err) => {
     }
     process.exit(1);
 });
+
+// ─── Self-health watchdog ────────────────────────────────────────
+// Periodically verify the HTTP server is still responsive.
+// If the self-health-check fails repeatedly, exit the process so
+// systemd (or another supervisor) can restart it.
+const SELF_HEALTH_INTERVAL_MS = 60000; // check every 60s
+let selfHealthFailCount = 0;
+const MAX_SELF_HEALTH_FAILURES = 3;
+
+setInterval(async () => {
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+        const resp = await fetch(`http://${CONFIG.host}:${CONFIG.port}/health`, {
+            signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        if (resp.ok) {
+            selfHealthFailCount = 0;
+        } else {
+            selfHealthFailCount++;
+            console.error(`[self-health] Failed: HTTP ${resp.status} (${selfHealthFailCount}/${MAX_SELF_HEALTH_FAILURES})`);
+        }
+    } catch (err) {
+        selfHealthFailCount++;
+        console.error(`[self-health] Failed: ${err.message} (${selfHealthFailCount}/${MAX_SELF_HEALTH_FAILURES})`);
+    }
+    if (selfHealthFailCount >= MAX_SELF_HEALTH_FAILURES) {
+        console.error(`[self-health] ${MAX_SELF_HEALTH_FAILURES} consecutive failures — exiting for restart`);
+        process.exit(1);
+    }
+}, SELF_HEALTH_INTERVAL_MS);
 
 // Graceful shutdown
 for (const signal of ["SIGINT", "SIGTERM"]) {

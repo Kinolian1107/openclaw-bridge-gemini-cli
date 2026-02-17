@@ -14,7 +14,7 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     set +a
 fi
 
-export GEMINI_MODEL="${GEMINI_MODEL:-gemini-3-pro-preview}"
+export GEMINI_MODEL="${GEMINI_MODEL:-gemini-3-flash-preview}"
 export GEMINI_APPROVAL_MODE="${GEMINI_APPROVAL_MODE:-yolo}"
 export BRIDGE_PORT="${BRIDGE_PORT:-18791}"
 
